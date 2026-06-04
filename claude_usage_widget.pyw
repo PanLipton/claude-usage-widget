@@ -836,11 +836,11 @@ class UsageWidget:
         self._menu_win = win
 
         tk.Label(body, text="Add account", bg=C_PANEL, fg=C_TEXT,
-                 font=(FONT, 9, "bold"), anchor="w", padx=14, pady=(10, 2)
-                 ).pack(fill="x")
+                 font=(FONT, 9, "bold"), anchor="w", padx=14
+                 ).pack(fill="x", pady=(10, 2))
         tk.Label(body, text="CLI label and config directory",
                  bg=C_PANEL, fg=C_MUTED, font=(FONT, 8), anchor="w",
-                 padx=14, pady=(0, 8)).pack(fill="x")
+                 padx=14).pack(fill="x", pady=(0, 8))
 
         def field(caption, default):
             tk.Label(body, text=caption, bg=C_PANEL, fg=C_LABEL,
@@ -904,12 +904,12 @@ class UsageWidget:
         self._menu_win = win
 
         tk.Label(body, text="Remove account", bg=C_PANEL, fg=C_TEXT,
-                 font=(FONT, 9, "bold"), anchor="w", padx=14, pady=(10, 2)
-                 ).pack(fill="x")
+                 font=(FONT, 9, "bold"), anchor="w", padx=14
+                 ).pack(fill="x", pady=(10, 2))
         tk.Label(body, text="%s  will be removed from the widget.\n"
                             "Your Claude login is not touched." % label,
                  bg=C_PANEL, fg=C_MUTED, font=(FONT, 8), anchor="w",
-                 justify="left", padx=14, pady=(0, 10)).pack(fill="x")
+                 justify="left", padx=14).pack(fill="x", pady=(0, 10))
 
         def confirm():
             del self.config["accounts"][i]
