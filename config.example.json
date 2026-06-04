@@ -1,0 +1,6 @@
+{
+  "poll_seconds": 180,
+  "accounts": [
+    { "label": "claude", "config_dir": "%USERPROFILE%\\.claude" }
+  ]
+}

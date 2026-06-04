@@ -1,0 +1,16 @@
+# Personal config (created automatically from config.example.json on first run).
+# Keeps your account labels / config-dir paths out of version control.
+config.json
+config.json.tmp
+
+# Window position cache
+widget_state.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Local agent / editor state
+.claude/
+.env
