@@ -34,7 +34,7 @@ matching Claude CLI right there.
 ## Install & run
 
 ```powershell
-git clone https://github.com/<your-username>/claude-usage-widget.git
+git clone https://github.com/PanLipton/claude-usage-widget.git
 cd claude-usage-widget
 ```
 
