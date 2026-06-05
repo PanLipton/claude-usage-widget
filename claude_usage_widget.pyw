@@ -35,6 +35,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "config.json")
 CONFIG_EXAMPLE_PATH = os.path.join(HERE, "config.example.json")
 STATE_PATH = os.path.join(HERE, "widget_state.json")
+# Shared, machine-readable snapshot of the latest usage for every account.
+# Other local tools (e.g. the E-Likarnya app) read this instead of hitting the
+# OAuth usage endpoint themselves, so they don't burn extra rate-limited calls.
+USAGE_STATE_PATH = os.path.join(HERE, "widget_usage.json")
 
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
@@ -212,6 +216,36 @@ def fetch_account(acc, prev=None):
     return out
 
 
+def write_usage_state(accounts_cfg, state):
+    """Persist the latest per-account usage to widget_usage.json (atomic).
+
+    Consumed by other local tools so they can show live session/weekly limits
+    without spending their own API calls. Each account carries its expanded
+    config_dir so a reader can match by login regardless of ordering.
+    """
+    accounts = []
+    for i, acc in enumerate(accounts_cfg):
+        s = state[i] if i < len(state) else {}
+        accounts.append({
+            "label": acc.get("label", ""),
+            "config_dir": acc.get("config_dir", ""),
+            "config_dir_expanded": expand(acc.get("config_dir", "")),
+            "email": s.get("email"),
+            "five": s.get("five"),
+            "seven": s.get("seven"),
+            "error": s.get("error"),
+            "loaded": bool(s.get("loaded")),
+        })
+    data = {"updated_at": time.time(), "accounts": accounts}
+    try:
+        tmp = USAGE_STATE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp, USAGE_STATE_PATH)
+    except OSError:
+        pass
+
+
 def recent_projects(accounts, limit=MAX_RECENT):
     """Most-recent project dirs across all accounts (newest first).
 
@@ -334,6 +368,12 @@ class UsageWidget:
     PAD = 16
     HEADER_H = 30
     COL_GAP = 24
+    # collapsed (mini) view — one session-usage ring per account
+    COLLAPSE_PAD = 14
+    COLLAPSE_RING = 52     # outer ring diameter
+    COLLAPSE_GAP = 18
+    COLLAPSE_TOP = 24      # space above the rings for the title-bar buttons
+    RING_TH = 7            # ring stroke thickness
 
     def __init__(self, root, config):
         self.root = root
@@ -342,8 +382,12 @@ class UsageWidget:
         self.poll = max(15, int(config.get("poll_seconds", 60)))
         self.topmost = True
 
-        self.W = self._calc_width()
-        self.H = 214
+        self.H_FULL = 214
+        self.collapsed = bool(self._read_state().get("collapsed", False))
+        if self.collapsed:
+            self.W, self.H = self._collapsed_dims()
+        else:
+            self.W, self.H = self._calc_width(), self.H_FULL
 
         self.label_color = {a.get("label", ""): ACCOUNT_ACCENTS[i % len(ACCOUNT_ACCENTS)]
                             for i, a in enumerate(self.accounts_cfg)}
@@ -359,6 +403,8 @@ class UsageWidget:
         self._hover_proj = None
         self._hover_del = None
         self._menu_win = None
+        self._dragging = False
+        self._dx = self._dy = 0
         self.last_update = 0.0
         self._stop = threading.Event()
 
@@ -389,10 +435,16 @@ class UsageWidget:
         r.configure(bg=C_KEY)
         r.protocol("WM_DELETE_WINDOW", self.close)
 
-    def _load_pos(self):
+    def _read_state(self):
         try:
             with open(STATE_PATH, "r", encoding="utf-8") as f:
-                s = json.load(f)
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def _load_pos(self):
+        s = self._read_state()
+        try:
             return int(s["x"]), int(s["y"])
         except Exception:
             sw = self.root.winfo_screenwidth()
@@ -401,7 +453,8 @@ class UsageWidget:
     def _save_pos(self):
         try:
             with open(STATE_PATH, "w", encoding="utf-8") as f:
-                json.dump({"x": self.root.winfo_x(), "y": self.root.winfo_y()}, f)
+                json.dump({"x": self.root.winfo_x(), "y": self.root.winfo_y(),
+                           "collapsed": self.collapsed}, f)
         except Exception:
             pass
 
@@ -411,15 +464,23 @@ class UsageWidget:
                            bg=C_KEY, highlightthickness=0, bd=0)
         self.c.pack(fill="both", expand=True)
 
-        # dragging (bound to background + title tag)
+        # Dragging. Initiation is bound to the background "drag" tag so that
+        # clicking buttons doesn't move the window, but the motion/release
+        # handlers live on the canvas widget itself. The periodic render()
+        # calls c.delete("all"), which destroys the tagged items; a tag-level
+        # <B1-Motion> binding would stop firing the moment its item vanished,
+        # freezing the drag until the next press. Widget-level bindings survive
+        # item deletion, so the drag keeps tracking the cursor across renders.
         self.c.tag_bind("drag", "<Button-1>", self._drag_start)
-        self.c.tag_bind("drag", "<B1-Motion>", self._drag_move)
+        self.c.bind("<B1-Motion>", self._drag_move)
+        self.c.bind("<ButtonRelease-1>", self._drag_end)
 
         # window buttons
         self.c.tag_bind("btn_pin", "<Button-1>", lambda e: self.toggle_pin())
         self.c.tag_bind("btn_close", "<Button-1>", lambda e: self.close())
         self.c.tag_bind("btn_add", "<Button-1>", lambda e: self._add_account_dialog())
-        for tag in ("btn_pin", "btn_close", "btn_add"):
+        self.c.tag_bind("btn_collapse", "<Button-1>", lambda e: self.toggle_collapse())
+        for tag in ("btn_pin", "btn_close", "btn_add", "btn_collapse"):
             self.c.tag_bind(tag, "<Enter>", lambda e: self.c.config(cursor="hand2"))
             self.c.tag_bind(tag, "<Leave>", lambda e: self.c.config(cursor=""))
 
@@ -453,6 +514,12 @@ class UsageWidget:
             self.c.tag_bind("del_%d" % i, "<Enter>",
                             lambda e, i=i: self._del_enter(i))
             self.c.tag_bind("del_%d" % i, "<Leave>", lambda e: self._del_leave())
+            # collapsed-view session rings: hover for details, double-click expands
+            self.c.tag_bind("ring_%d" % i, "<Enter>",
+                            lambda e, i=i: self._ring_enter(i))
+            self.c.tag_bind("ring_%d" % i, "<Leave>", lambda e: self._ring_leave())
+            self.c.tag_bind("ring_%d" % i, "<Double-Button-1>",
+                            lambda e: self.toggle_collapse())
 
     def _hint_text(self, i):
         a = self.accounts_cfg[i]
@@ -484,6 +551,13 @@ class UsageWidget:
         return self.c.create_polygon(pts, smooth=True, **kw)
 
     def render(self):
+        """Dispatch to the full or the collapsed (mini-ring) layout."""
+        if self.collapsed:
+            self._render_collapsed()
+        else:
+            self._render_full()
+
+    def _render_full(self):
         c = self.c
         c.delete("all")
         W, H = self.W, self.H
@@ -516,9 +590,11 @@ class UsageWidget:
         c.create_text(self.PAD + 132, 19, text=ago, anchor="w",
                       fill=ago_col, font=(FONT, 8), tags="drag")
 
-        # window buttons (add + pin + close)
-        c.create_text(W - 66, 18, text="＋", anchor="center",
+        # window buttons (add + collapse + pin + close)
+        c.create_text(W - 88, 18, text="＋", anchor="center",
                       fill=C_BTN, font=(FONT, 12), tags="btn_add")
+        c.create_text(W - 66, 18, text="－", anchor="center",
+                      fill=C_BTN, font=(FONT, 12), tags="btn_collapse")
         pin_col = C_OK if self.topmost else C_BTN
         c.create_text(W - 44, 18, text="◉", anchor="center",
                       fill=pin_col, font=(FONT, 12), tags="btn_pin")
@@ -651,6 +727,107 @@ class UsageWidget:
                 self.round_rect(x, by, x + bw, by + bh, 6, fill=C_PANEL,
                                 outline=C_DIVIDER, tags="drag")
 
+    # -- collapsed (mini) view ----------------------------------------------
+    def _render_collapsed(self):
+        """A compact panel: one session-usage ring per account.
+
+        Each ring's arc is filled to the account's 5-hour utilization and
+        coloured by the same OK/WARN/CRIT thresholds as the full bars; the
+        account accent (its identity colour) labels it underneath.
+        """
+        c = self.c
+        c.delete("all")
+        W, H = self.W, self.H
+
+        self.round_rect(1, 1, W - 1, H - 1, 14, fill=C_PANEL,
+                        outline=C_BORDER, width=1, tags="drag")
+
+        # overall status dot — same meaning as the full header's
+        err = self._first_error()
+        has_data = any(a.get("loaded") for a in self.state)
+        if not self.last_update:
+            dot = C_MUTED
+        elif err and has_data:
+            dot = C_WARN
+        elif err:
+            dot = C_CRIT
+        else:
+            dot = C_OK
+        c.create_oval(12, 10, 19, 17, fill=dot, outline="", tags="drag")
+
+        # restore + close (□ renders low for its box, so nudge it up to sit
+        # level with the ✕)
+        c.create_text(W - 34, 11, text="□", anchor="center",
+                      fill=C_BTN, font=(FONT, 11), tags="btn_collapse")
+        c.create_text(W - 16, 13, text="✕", anchor="center",
+                      fill=C_BTN, font=(FONT, 11), tags="btn_close")
+
+        n = len(self.state)
+        ring = self.COLLAPSE_RING
+        total = n * ring + (n - 1) * self.COLLAPSE_GAP
+        x_left = (W - total) / 2
+        cy = self.COLLAPSE_TOP + ring / 2
+        for i, acc in enumerate(self.state):
+            cx = x_left + i * (ring + self.COLLAPSE_GAP) + ring / 2
+            self._draw_ring(i, cx, cy, acc)
+
+    def _draw_ring(self, i, cx, cy, acc):
+        c = self.c
+        tag = "ring_%d" % i
+        label = acc.get("label", "")
+        accent = self.label_color.get(label, C_MUTED)
+        th = self.RING_TH
+        r = self.COLLAPSE_RING / 2 - th / 2
+        x0, y0, x1, y1 = cx - r, cy - r, cx + r, cy + r
+
+        # full track, then the utilization arc clockwise from 12 o'clock
+        c.create_oval(x0, y0, x1, y1, outline=C_TRACK, width=th, tags=tag)
+        data = acc.get("five") or {}
+        pct = max(0.0, min(100.0, data.get("util", 0.0)))
+        col = color_for(pct)
+        if acc.get("loaded"):
+            if pct > 0:
+                extent = max(-359.999, -3.6 * pct)
+                c.create_arc(x0, y0, x1, y1, start=90, extent=extent,
+                             style="arc", outline=col, width=th, tags=tag)
+            c.create_text(cx, cy - 1, text="%d%%" % round(pct), anchor="center",
+                          fill=col, font=(FONT, 10, "bold"), tags=tag)
+        elif acc.get("error"):
+            c.create_text(cx, cy - 1, text="!", anchor="center",
+                          fill=C_CRIT, font=(FONT, 13, "bold"), tags=tag)
+        else:
+            c.create_text(cx, cy - 1, text="…", anchor="center",
+                          fill=C_MUTED, font=(FONT, 12, "bold"), tags=tag)
+
+        # account identity below the ring
+        c.create_text(cx, cy + r + th / 2 + 8,
+                      text=self._fit(label, self.COLLAPSE_RING + self.COLLAPSE_GAP,
+                                     self.f_small),
+                      anchor="center", fill=accent, font=self.f_small, tags=tag)
+
+    def _ring_tip(self, i):
+        acc = self.state[i]
+        head = acc.get("email") or self.accounts_cfg[i].get("label", "")
+        if not acc.get("loaded"):
+            return "%s\n%s" % (head, acc.get("error") or "loading…")
+        five = acc.get("five") or {}
+        seven = acc.get("seven") or {}
+        tail = "\n⚠ %s (stale)" % acc["error"] if acc.get("error") else ""
+        return ("%s\nSession  %d%%   ·   resets in %s\n"
+                "Weekly  %d%%   ·   resets in %s%s"
+                % (head,
+                   round(five.get("util", 0.0)), fmt_delta(five.get("reset")),
+                   round(seven.get("util", 0.0)), fmt_delta(seven.get("reset")),
+                   tail))
+
+    def _ring_enter(self, i):
+        self.c.config(cursor="hand2")
+        self.tip.show(self._ring_tip(i))
+
+    def _ring_leave(self):
+        self.c.config(cursor="")
+        self.tip.hide()
+
     def _any_error(self):
         return any(a.get("error") for a in self.state)
 
@@ -662,16 +839,45 @@ class UsageWidget:
 
     # -- interaction --------------------------------------------------------
     def _drag_start(self, e):
+        # Press landed on the background -> begin a drag. Buttons have their own
+        # tag bindings and never set this flag, so they don't move the window.
+        self._dragging = True
         self._dx, self._dy = e.x, e.y
 
     def _drag_move(self, e):
+        # Widget-level binding fires for every B1 motion; only act on a real drag
+        # started from the background. e.x/e.y are relative to the canvas, which
+        # moves with the window, so the press offset (_dx/_dy) stays valid.
+        if not self._dragging:
+            return
         nx = self.root.winfo_x() + (e.x - self._dx)
         ny = self.root.winfo_y() + (e.y - self._dy)
         self.root.geometry("+%d+%d" % (nx, ny))
 
+    def _drag_end(self, e):
+        self._dragging = False
+
     def toggle_pin(self):
         self.topmost = not self.topmost
         self.root.attributes("-topmost", self.topmost)
+
+    def toggle_collapse(self):
+        # Anchor on the top-right edge so a right-docked widget keeps its corner
+        # put while it shrinks/grows toward the screen interior.
+        old_right = self.root.winfo_x() + self.W
+        old_top = self.root.winfo_y()
+        self.collapsed = not self.collapsed
+        self.tip.hide()
+        self._close_menu()
+        if self.collapsed:
+            self.W, self.H = self._collapsed_dims()
+        else:
+            self.W, self.H = self._calc_width(), self.H_FULL
+        new_x = max(0, old_right - self.W)
+        self.c.config(width=self.W, height=self.H)
+        self.root.geometry("%dx%d+%d+%d" % (self.W, self.H, new_x, old_top))
+        self.render()
+        self._save_pos()
 
     def _open_proj(self, j):
         it = self._proj_meta.get(j)
@@ -804,6 +1010,24 @@ class UsageWidget:
         """
         n = max(1, len(self.accounts_cfg))
         return max(250 * n + self.PAD, 320)
+
+    def _collapsed_dims(self):
+        """Window size for the mini view (one session ring per account)."""
+        n = max(1, len(self.accounts_cfg))
+        w = (2 * self.COLLAPSE_PAD + n * self.COLLAPSE_RING
+             + (n - 1) * self.COLLAPSE_GAP)
+        h = self.COLLAPSE_TOP + self.COLLAPSE_RING + 22
+        return int(max(w, 128)), int(h)
+
+    def _apply_geometry(self):
+        """Resize the window/canvas to match the current view, keeping position."""
+        if self.collapsed:
+            self.W, self.H = self._collapsed_dims()
+        else:
+            self.W, self.H = self._calc_width(), self.H_FULL
+        self.c.config(width=self.W, height=self.H)
+        self.root.geometry("%dx%d+%d+%d" % (
+            self.W, self.H, self.root.winfo_x(), self.root.winfo_y()))
 
     def _make_popup(self):
         """A 1px-bordered, panel-coloured Toplevel matching the widget palette."""
@@ -956,10 +1180,7 @@ class UsageWidget:
                                "error": None, "loaded": False})
             for a in self.accounts_cfg]
         self._hover_del = None
-        self.W = self._calc_width()
-        self.c.config(width=self.W)
-        self.root.geometry("%dx%d+%d+%d" % (
-            self.W, self.H, self.root.winfo_x(), self.root.winfo_y()))
+        self._apply_geometry()
         try:
             self.recent = recent_projects(self.accounts_cfg)
         except Exception:
@@ -1010,6 +1231,11 @@ class UsageWidget:
                 except Exception:
                     pass
                 self.last_update = time.time()
+                # Expose the fresh numbers to other local tools (E-Likarnya, …).
+                try:
+                    write_usage_state(self.accounts_cfg, self.state)
+                except Exception:
+                    pass
             # tick often enough to honour per-account timers
             self._stop.wait(min(15, self.poll))
 

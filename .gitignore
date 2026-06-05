@@ -6,6 +6,10 @@ config.json.tmp
 # Window position cache
 widget_state.json
 
+# Live usage snapshot shared with other local tools (contains account e-mails)
+widget_usage.json
+widget_usage.json.tmp
+
 # Python
 __pycache__/
 *.py[cod]

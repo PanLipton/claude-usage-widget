@@ -17,6 +17,20 @@ The row of buttons at the bottom lists your **most-recent projects** across all
 accounts. Click one to open a new terminal in that folder and launch the
 matching Claude CLI right there.
 
+## Compact mode
+
+Click **－** in the title bar to collapse the widget into a tiny panel showing
+just a **session-usage ring per account** — one ring for each configured
+account, filled to its current 5-hour utilization and colour-coded the same way
+as the full bars (green → yellow → red), with the account's accent colour
+labelling it underneath.
+
+![collapsed preview](preview-collapsed.png)
+
+Hover a ring for the full session **and** weekly breakdown, then click **□** (or
+double-click a ring) to expand back to the full view. The widget remembers which
+mode it was in across restarts.
+
 > **Privacy:** everything runs locally. The widget talks only to Anthropic's
 > own API (the same endpoints Claude Code uses) with your existing local login.
 > No e-mails, tokens, or usage data are sent anywhere else, and nothing personal
@@ -53,6 +67,8 @@ the **➕** button in the widget, to add your own accounts.
 
 - **Drag** — grab anywhere on the panel and move it.
 - **➕** — add an account (opens a small inline form).
+- **－ / □** — collapse to the [compact ring view](#compact-mode) / restore the
+  full layout.
 - **◉** — pin on top. Green = always-on-top (default), grey = off.
 - **✕** — close. The window position is remembered in `widget_state.json`.
 - **✕ next to an account** — remove that account (appears only when you have
@@ -210,6 +226,20 @@ into that folder.
 Кнопки знизу — **останні проєкти** по всіх акаунтах: клік відкриває новий
 термінал у теці проєкту й запускає відповідний Claude CLI.
 
+## Компактний режим
+
+Кнопка **－** у заголовку згортає віджет у маленьку панель, де лишаються тільки
+**кільця сесійного навантаження** — по одному кільцю на кожен акаунт. Кільце
+заповнюється відповідно до поточного 5-годинного ліміту й має той самий колір,
+що й повні смуги (зелений → жовтий → червоний), а під ним — акцентний колір
+акаунта.
+
+![компактний режим](preview-collapsed.png)
+
+Наведіть на кільце, щоб побачити повну сесійну **й** тижневу інформацію, а тоді
+натисніть **□** (або подвійний клік по кільцю), щоб розгорнути назад. Віджет
+запам'ятовує обраний режим між запусками.
+
 > **Приватність:** усе працює локально. Віджет звертається лише до API Anthropic
 > (ті самі ендпоінти, що й Claude Code) із вашим локальним логіном. Жодні дані
 > нікуди більше не передаються; у репозиторії немає особистих даних — ваш
@@ -231,6 +261,8 @@ into that folder.
 
 - **Перетягування** — затисніть будь-де на панелі.
 - **➕** — додати акаунт (невелика форма прямо у віджеті).
+- **－ / □** — згорнути у [компактний режим з кільцями](#компактний-режим) /
+  розгорнути назад.
 - **◉** — закріпити поверх вікон (зелений = увімкнено, сірий = вимкнено).
 - **✕** — закрити (позиція запам'ятовується).
 - **✕ біля акаунта** — прибрати акаунт (з'являється лише коли акаунтів більше
