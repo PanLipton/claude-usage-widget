@@ -1,6 +1,11 @@
 {
   "poll_seconds": 180,
+  "launch_mode": "cli",
+  "desktop": {
+    "aumid": "Claude_pzs8sxrjxfjjc!Claude",
+    "standalone_exe": "%LOCALAPPDATA%\\ClaudeDesktopStandalone\\app\\Claude.exe"
+  },
   "accounts": [
-    { "label": "claude", "config_dir": "%USERPROFILE%\\.claude" }
+    { "label": "claude", "config_dir": "%USERPROFILE%\\.claude", "desktop": "store" }
   ]
 }

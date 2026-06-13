@@ -42,12 +42,26 @@ USAGE_STATE_PATH = os.path.join(HERE, "widget_usage.json")
 
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
-TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
+TOKEN_URL = "https://api.anthropic.com/v1/oauth/token"
 CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 USER_AGENT = "claude-cli/2.0.0 (external, cli)"
 REFRESH_SKEW_SEC = 120  # refresh this long before expiry
 CREATE_NEW_CONSOLE = 0x00000010
 MAX_RECENT = 3
+
+# How a project button launches Claude. "cli" opens a terminal and runs the
+# matching claudeN.bat (the classic behaviour); "desktop" opens the Claude
+# Desktop app for that account instead. Toggled globally in Settings (⚙).
+LAUNCH_CLI = "cli"
+LAUNCH_DESKTOP = "desktop"
+
+# Claude Desktop is shipped as an MSIX/Store package. The primary account is
+# launched through its stable AUMID (PackageFamilyName!AppId); the packaged
+# binary can't be run twice for two logins, so any *additional* Desktop account
+# runs from a loose copy of the same payload pointed at its own --user-data-dir
+# (see tools/setup_desktop_account.ps1 and the README).
+DEFAULT_AUMID = "Claude_pzs8sxrjxfjjc!Claude"
+DEFAULT_STANDALONE_EXE = r"%LOCALAPPDATA%\ClaudeDesktopStandalone\app\Claude.exe"
 
 # Palette (dark, minimalist, cohesive)
 C_KEY = "#000000"        # transparent-color key for rounded corners
@@ -96,9 +110,16 @@ def load_config():
                 dst.write(data)
         except OSError:
             pass
-    path = CONFIG_PATH if os.path.exists(CONFIG_PATH) else CONFIG_EXAMPLE_PATH
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    # A corrupt/unreadable config must not kill the app before the window
+    # exists (a .pyw has no console to show the traceback) — fall back to
+    # the example, then to an empty account set.
+    for path in (CONFIG_PATH, CONFIG_EXAMPLE_PATH):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            continue
+    return {"accounts": []}
 
 
 def _http_json(url, method="GET", token=None, body=None, timeout=20):
@@ -134,8 +155,18 @@ def refresh_token(cred_path, cred_data):
             "client_id": CLIENT_ID,
         },
     )
+    # The Claude CLI rewrites this same file; re-read it just before writing
+    # so a stale snapshot doesn't clobber whatever it changed while the POST
+    # was in flight (only our oauth fields are merged into the fresh copy).
+    try:
+        with open(cred_path, "r", encoding="utf-8") as f:
+            fresh = json.load(f)
+        cred_data = fresh
+        oauth = cred_data.setdefault("claudeAiOauth", oauth)
+    except (OSError, ValueError):
+        pass
     oauth["accessToken"] = resp["access_token"]
-    oauth["refreshToken"] = resp.get("refresh_token", oauth["refreshToken"])
+    oauth["refreshToken"] = resp.get("refresh_token") or oauth.get("refreshToken")
     oauth["expiresAt"] = int(time.time() * 1000) + int(resp.get("expires_in", 0)) * 1000
     tmp = cred_path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -174,13 +205,19 @@ def fetch_account(acc, prev=None):
     usage values are kept so the widget shows stale data instead of blanking.
     """
     prev = prev or {}
-    config_dir = expand(acc["config_dir"])
     out = {"label": acc.get("label", ""),
            "email": prev.get("email"),
            "five": prev.get("five"),
            "seven": prev.get("seven"),
            "loaded": prev.get("loaded", False),
            "error": None}
+    cdir = acc.get("config_dir")
+    if not cdir:
+        # a malformed account entry must not raise — it would kill the
+        # polling thread, freezing every other account at "loading…"
+        out["error"] = "no config_dir"
+        return out
+    config_dir = expand(cdir)
     try:
         token = get_token(config_dir)
         try:
@@ -223,9 +260,10 @@ def write_usage_state(accounts_cfg, state):
     without spending their own API calls. Each account carries its expanded
     config_dir so a reader can match by login regardless of ordering.
     """
+    by_label = {s.get("label"): s for s in state}
     accounts = []
-    for i, acc in enumerate(accounts_cfg):
-        s = state[i] if i < len(state) else {}
+    for acc in accounts_cfg:
+        s = by_label.get(acc.get("label", "")) or {}
         accounts.append({
             "label": acc.get("label", ""),
             "config_dir": acc.get("config_dir", ""),
@@ -254,8 +292,10 @@ def recent_projects(accounts, limit=MAX_RECENT):
     """
     best = {}  # path -> [timestamp, label]
     for acc in accounts:
-        cdir = expand(acc["config_dir"])
+        cdir = expand(acc.get("config_dir") or "")
         label = acc.get("label", "")
+        if not cdir:
+            continue
         hist = os.path.join(cdir, "history.jsonl")
         try:
             with open(hist, "r", encoding="utf-8") as f:
@@ -305,6 +345,47 @@ def open_project(path, label):
             subprocess.Popen(["cmd", "/k", cmd], creationflags=CREATE_NEW_CONSOLE)
         except Exception:
             pass
+
+
+def open_desktop(acc, desktop_cfg, index):
+    """Open the Claude Desktop app for one account.
+
+    Resolution of how to launch is, in order: the account's own ``desktop``
+    setting, then a sensible default (the first account uses the installed
+    Store app, the rest each get an isolated standalone profile).
+
+      * ``"store"``                       -> launch the packaged app via its AUMID
+      * ``{"data_dir": "...", "exe": ...}``-> launch a loose copy of the payload
+                                             with ``--user-data-dir`` so it holds
+                                             its own, separate login
+
+    Anything that fails (missing copy, bad AUMID) is swallowed — a misconfigured
+    button simply does nothing rather than crashing the widget.
+    """
+    acc = acc or {}
+    spec = acc.get("desktop")
+    if spec is None:
+        # default mapping: first account = the installed Store app, others get
+        # their own standalone profile keyed by label.
+        spec = "store" if index == 0 else {
+            "data_dir": r"%USERPROFILE%\.claude-desktop-" + acc.get("label", "")}
+    aumid = (desktop_cfg or {}).get("aumid", DEFAULT_AUMID)
+    try:
+        if spec == "store":
+            # explorer is the standard launcher for AppsFolder (AUMID) targets.
+            subprocess.Popen(["explorer.exe", "shell:AppsFolder\\" + aumid])
+            return
+        if isinstance(spec, dict):
+            exe = expand(spec.get("exe")
+                         or (desktop_cfg or {}).get("standalone_exe",
+                                                    DEFAULT_STANDALONE_EXE))
+            data_dir = expand(spec.get("data_dir", ""))
+            args = [exe]
+            if data_dir:
+                args.append("--user-data-dir=" + data_dir)
+            subprocess.Popen(args)
+    except Exception:
+        pass
 
 
 def fmt_delta(reset_epoch):
@@ -381,6 +462,9 @@ class UsageWidget:
         self.accounts_cfg = config.get("accounts", [])
         self.poll = max(15, int(config.get("poll_seconds", 60)))
         self.topmost = True
+        # global launch target for project buttons (Settings ⚙)
+        self.launch_mode = (config.get("launch_mode") or LAUNCH_CLI)
+        self.desktop_cfg = config.get("desktop", {})
 
         self.H_FULL = 214
         self.collapsed = bool(self._read_state().get("collapsed", False))
@@ -452,9 +536,11 @@ class UsageWidget:
 
     def _save_pos(self):
         try:
-            with open(STATE_PATH, "w", encoding="utf-8") as f:
+            tmp = STATE_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump({"x": self.root.winfo_x(), "y": self.root.winfo_y(),
                            "collapsed": self.collapsed}, f)
+            os.replace(tmp, STATE_PATH)
         except Exception:
             pass
 
@@ -479,8 +565,9 @@ class UsageWidget:
         self.c.tag_bind("btn_pin", "<Button-1>", lambda e: self.toggle_pin())
         self.c.tag_bind("btn_close", "<Button-1>", lambda e: self.close())
         self.c.tag_bind("btn_add", "<Button-1>", lambda e: self._add_account_dialog())
+        self.c.tag_bind("btn_settings", "<Button-1>", lambda e: self._settings_dialog())
         self.c.tag_bind("btn_collapse", "<Button-1>", lambda e: self.toggle_collapse())
-        for tag in ("btn_pin", "btn_close", "btn_add", "btn_collapse"):
+        for tag in ("btn_pin", "btn_close", "btn_add", "btn_settings", "btn_collapse"):
             self.c.tag_bind(tag, "<Enter>", lambda e: self.c.config(cursor="hand2"))
             self.c.tag_bind(tag, "<Leave>", lambda e: self.c.config(cursor=""))
 
@@ -569,30 +656,34 @@ class UsageWidget:
         # header
         err = self._first_error()
         has_data = any(a.get("loaded") for a in self.state)
-        if not self.last_update:
-            dot = C_MUTED
-        elif err and has_data:
+        if err and has_data:
             dot = C_WARN          # stale: showing last-known values
         elif err:
             dot = C_CRIT          # error and nothing to show
+        elif not self.last_update:
+            dot = C_MUTED
         else:
             dot = C_OK
         c.create_oval(self.PAD, 14, self.PAD + 9, 23, fill=dot, outline="",
                       tags="drag")
         c.create_text(self.PAD + 16, 18, text="Claude Usage", anchor="w",
                       fill=C_TEXT, font=(FONT, 10, "bold"), tags="drag")
-        if not self.last_update:
+        if err:
+            ago = ("%s · updated %s ago" % (err, fmt_ago(self.last_update))
+                   if self.last_update else err)
+            ago_col = C_WARN
+        elif not self.last_update:
             ago, ago_col = "loading", C_MUTED
-        elif err:
-            ago, ago_col = "%s · updated %s ago" % (err, fmt_ago(self.last_update)), C_WARN
         else:
             ago, ago_col = "updated %s ago" % fmt_ago(self.last_update), C_MUTED
         c.create_text(self.PAD + 132, 19, text=ago, anchor="w",
                       fill=ago_col, font=(FONT, 8), tags="drag")
 
-        # window buttons (add + collapse + pin + close)
-        c.create_text(W - 88, 18, text="＋", anchor="center",
+        # window buttons (add + settings + collapse + pin + close)
+        c.create_text(W - 110, 18, text="＋", anchor="center",
                       fill=C_BTN, font=(FONT, 12), tags="btn_add")
+        c.create_text(W - 88, 19, text="⚙", anchor="center",
+                      fill=C_BTN, font=(FONT, 11), tags="btn_settings")
         c.create_text(W - 66, 18, text="－", anchor="center",
                       fill=C_BTN, font=(FONT, 12), tags="btn_collapse")
         pin_col = C_OK if self.topmost else C_BTN
@@ -603,6 +694,13 @@ class UsageWidget:
 
         # account columns
         n = len(self.state)
+        if not n:
+            # an empty account set must not divide by zero — point at ＋
+            c.create_text(W / 2, H / 2 - 10, text="no accounts — add one with ＋",
+                          anchor="center", fill=C_MUTED, font=(FONT, 9),
+                          tags="drag")
+            self._draw_projects()
+            return
         inner_w = W - 2 * self.PAD
         col_w = (inner_w - (n - 1) * self.COL_GAP) / n
         top = self.HEADER_H + 8
@@ -745,12 +843,12 @@ class UsageWidget:
         # overall status dot — same meaning as the full header's
         err = self._first_error()
         has_data = any(a.get("loaded") for a in self.state)
-        if not self.last_update:
-            dot = C_MUTED
-        elif err and has_data:
+        if err and has_data:
             dot = C_WARN
         elif err:
             dot = C_CRIT
+        elif not self.last_update:
+            dot = C_MUTED
         else:
             dot = C_OK
         c.create_oval(12, 10, 19, 17, fill=dot, outline="", tags="drag")
@@ -879,10 +977,25 @@ class UsageWidget:
         self.render()
         self._save_pos()
 
+    def _launch(self, label, path=None):
+        """Open a project for `label` using the globally-selected launch mode.
+
+        CLI mode opens a terminal in `path` and runs the account's CLI; Desktop
+        mode opens the Claude Desktop app for that account (the project path is
+        not used — Desktop has no working-directory argument).
+        """
+        if self.launch_mode == LAUNCH_DESKTOP:
+            idx = next((i for i, a in enumerate(self.accounts_cfg)
+                        if a.get("label") == label), 0)
+            acc = self.accounts_cfg[idx] if idx < len(self.accounts_cfg) else None
+            open_desktop(acc, self.desktop_cfg, idx)
+        else:
+            open_project(path, label)
+
     def _open_proj(self, j):
         it = self._proj_meta.get(j)
         if it:
-            open_project(it["path"], it["label"])
+            self._launch(it["label"], it["path"])
 
     def _proj_menu(self, e, j):
         """Right-click: a widget-styled popup to pick which account opens it."""
@@ -952,7 +1065,7 @@ class UsageWidget:
 
         def on_click(_):
             self._close_menu()
-            open_project(path, label)
+            self._launch(label, path)
             return "break"
 
         for w in cells:
@@ -992,9 +1105,14 @@ class UsageWidget:
         # with a single account there is nothing to disambiguate — skip the tip
         if len(self.accounts_cfg) <= 1:
             return
-        self.tip.show("%s\n→ open a console and launch  %s\n"
-                      "(right-click — choose a different account)"
-                      % (it["path"], it["label"]))
+        if self.launch_mode == LAUNCH_DESKTOP:
+            self.tip.show("→ open Claude Desktop  ·  %s\n"
+                          "(right-click — choose a different account)"
+                          % it["label"])
+        else:
+            self.tip.show("%s\n→ open a console and launch  %s\n"
+                          "(right-click — choose a different account)"
+                          % (it["path"], it["label"]))
 
     def _proj_leave(self):
         self.c.config(cursor="")
@@ -1052,6 +1170,73 @@ class UsageWidget:
         btn.bind("<Leave>", lambda e: btn.configure(bg=C_BTNBG))
         btn.bind("<Button-1>", lambda e: command())
         return btn
+
+    def _settings_dialog(self):
+        """Small popup to pick the global launch target (CLI ⇄ Desktop)."""
+        self.tip.hide()
+        self._close_menu()
+        win, body = self._make_popup()
+        self._menu_win = win
+
+        tk.Label(body, text="Settings", bg=C_PANEL, fg=C_TEXT,
+                 font=(FONT, 9, "bold"), anchor="w", padx=14
+                 ).pack(fill="x", pady=(10, 2))
+        tk.Label(body, text="A project button opens…", bg=C_PANEL, fg=C_MUTED,
+                 font=(FONT, 8), anchor="w", padx=14).pack(fill="x", pady=(0, 4))
+
+        marks = {}
+        note = {"w": None}
+
+        def select(mode):
+            self.launch_mode = mode
+            self.config["launch_mode"] = mode
+            self._persist_config()
+            for m, lbl in marks.items():
+                lbl.configure(text="✓" if m == mode else "")
+            note["w"].configure(
+                text=("Needs a 2nd Desktop profile set up — see the README."
+                      if mode == LAUNCH_DESKTOP else ""))
+            self.render()
+
+        for mode, title, sub in (
+            (LAUNCH_CLI, "Claude CLI", "a terminal running claudeN.bat"),
+            (LAUNCH_DESKTOP, "Claude Desktop", "the desktop app for that account"),
+        ):
+            row = tk.Frame(body, bg=C_PANEL)
+            row.pack(fill="x")
+            chk = tk.Label(row, text="✓" if self.launch_mode == mode else "",
+                           bg=C_PANEL, fg=C_OK, font=(FONT, 9, "bold"), width=2)
+            chk.pack(side="left", padx=(12, 0))
+            marks[mode] = chk
+            txt = tk.Frame(row, bg=C_PANEL)
+            txt.pack(side="left", fill="x", expand=True, padx=(2, 14))
+            tk.Label(txt, text=title, bg=C_PANEL, fg=C_TEXT, font=(FONT, 9),
+                     anchor="w").pack(fill="x")
+            tk.Label(txt, text=sub, bg=C_PANEL, fg=C_MUTED, font=(FONT, 8),
+                     anchor="w").pack(fill="x")
+            for w in (row, chk, txt) + tuple(txt.winfo_children()):
+                w.bind("<Button-1>", lambda e, m=mode: select(m))
+                w.configure(cursor="hand2")
+
+        note["w"] = tk.Label(
+            body, text=("Needs a 2nd Desktop profile set up — see the README."
+                        if self.launch_mode == LAUNCH_DESKTOP else ""),
+            bg=C_PANEL, fg=C_WARN, font=(FONT, 8), anchor="w", padx=14,
+            wraplength=230, justify="left")
+        note["w"].pack(fill="x", pady=(2, 0))
+
+        row = tk.Frame(body, bg=C_PANEL)
+        row.pack(fill="x", padx=14, pady=(8, 12))
+        self._styled_button(row, "Close", C_MUTED,
+                            self._close_menu).pack(side="right")
+
+        win.bind("<Escape>", lambda e: self._close_menu())
+        rx, ry = self.root.winfo_x(), self.root.winfo_y()
+        self._place_popup(win, rx + self.W - 250, ry + self.HEADER_H)
+        try:
+            win.grab_set_global()
+        except tk.TclError:
+            win.grab_set()
 
     def _add_account_dialog(self):
         self.tip.hide()
@@ -1157,10 +1342,17 @@ class UsageWidget:
             win.grab_set()
 
     def _persist_config(self):
-        tmp = CONFIG_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(self.config, f, indent=2)
-        os.replace(tmp, CONFIG_PATH)
+        # Must not raise into a Tk callback: callers mutate in-memory state
+        # first, and an escaping error would skip the rebuild and strand a
+        # grabbed dialog open. On failure memory stays consistent; the next
+        # successful save writes the full config anyway.
+        try:
+            tmp = CONFIG_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.config, f, indent=2)
+            os.replace(tmp, CONFIG_PATH)
+        except OSError:
+            pass
 
     def _rebuild_accounts(self):
         """Apply a changed account set: resize, recolour, rebind, redraw.
@@ -1191,49 +1383,66 @@ class UsageWidget:
     def close(self):
         self._stop.set()
         self._save_pos()
+        # Give the worker a moment to finish an in-flight token refresh —
+        # dying between the POST and the write-back would lose a rotated
+        # refresh token and force a manual /login.
+        self.worker.join(timeout=2)
         self.root.destroy()
 
     # -- background polling -------------------------------------------------
     def _poll_loop(self):
-        # per-account backoff: a rate-limited account cools down on its own
-        # without stalling the healthy one.
-        fails = []
-        next_at = []
+        # Per-account backoff keyed by label, never by list index: the UI
+        # thread adds/removes accounts concurrently, so positional state would
+        # drift onto the wrong account. A rate-limited account cools down on
+        # its own without stalling the healthy one.
+        fails = {}
+        next_at = {}
         while not self._stop.is_set():
-            # snapshot — the account set can change while we poll (add/remove)
-            accounts = self.accounts_cfg
-            n = len(accounts)
-            if len(fails) != n:
-                fails = [0] * n
-                next_at = [0.0] * n
+            # real copy — the UI thread mutates the config list in place,
+            # and iterating the live list could run past the backoff maps
+            accounts = list(self.accounts_cfg)
+            labels = {a.get("label", "") for a in accounts}
+            fails = {k: v for k, v in fails.items() if k in labels}
+            next_at = {k: v for k, v in next_at.items() if k in labels}
             now = time.time()
             polled = False
-            for i, acc in enumerate(accounts):
+            fetched_ok = False
+            for acc in accounts:
                 if self._stop.is_set():
                     return
-                if now < next_at[i]:
+                label = acc.get("label", "")
+                if now < next_at.get(label, 0.0):
                     continue
                 polled = True
+                prev = next((s for s in self.state
+                             if s.get("label") == label), None)
+                res = fetch_account(acc, prev)
+                # write back by identity, not index — self.state may have
+                # been rebuilt (add/remove) while the fetch was in flight
                 st = self.state
-                res = fetch_account(acc, st[i] if i < len(st) else None)
-                st = self.state
-                if i < len(st):
-                    st[i] = res
+                for k, s in enumerate(st):
+                    if s.get("label") == label:
+                        st[k] = res
+                        break
                 if res.get("error"):
-                    fails[i] = min(fails[i] + 1, 5)
-                    next_at[i] = now + min(60 * (2 ** fails[i]), 600)
+                    fails[label] = min(fails.get(label, 0) + 1, 5)
+                    next_at[label] = now + min(60 * (2 ** fails[label]), 600)
                 else:
-                    fails[i] = 0
-                    next_at[i] = now + self.poll
+                    fails[label] = 0
+                    next_at[label] = now + self.poll
+                    fetched_ok = True
             if polled:
                 try:
-                    self.recent = recent_projects(self.accounts_cfg)
+                    self.recent = recent_projects(accounts)
                 except Exception:
                     pass
-                self.last_update = time.time()
+                # data age, not attempt age — a failed retry must not make
+                # stale bars look freshly updated in the header
+                if fetched_ok:
+                    self.last_update = time.time()
                 # Expose the fresh numbers to other local tools (E-Likarnya, …).
                 try:
-                    write_usage_state(self.accounts_cfg, self.state)
+                    write_usage_state(accounts, self.state)
                 except Exception:
                     pass
             # tick often enough to honour per-account timers

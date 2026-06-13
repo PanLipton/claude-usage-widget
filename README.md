@@ -67,6 +67,9 @@ the **➕** button in the widget, to add your own accounts.
 
 - **Drag** — grab anywhere on the panel and move it.
 - **➕** — add an account (opens a small inline form).
+- **⚙** — settings: choose globally whether a project button opens **Claude CLI**
+  (a terminal) or **Claude Desktop** (the app). See
+  [Opening projects in Claude Desktop](#opening-projects-in-claude-desktop).
 - **－ / □** — collapse to the [compact ring view](#compact-mode) / restore the
   full layout.
 - **◉** — pin on top. Green = always-on-top (default), grey = off.
@@ -179,6 +182,82 @@ that account, which opens a terminal running its CLI.
 
 ---
 
+## Opening projects in Claude Desktop
+
+By default a project button opens a **terminal** and runs that account's Claude
+CLI. Open **Settings (⚙)** to flip a single global switch so project buttons open
+the **Claude Desktop** app for that account instead:
+
+- **Claude CLI** — a console running `claudeN.bat` (the default).
+- **Claude Desktop** — the desktop app, one window per account.
+
+(The switch is global, not per-account; it's saved as `launch_mode` in
+`config.json`. In Desktop mode the project *path* isn't used — Desktop has no
+working-directory argument — so a click just brings up that account's app.)
+
+### Why Desktop needs extra setup (and the CLI doesn't)
+
+Claude Code (CLI) picks its login from `CLAUDE_CONFIG_DIR`, so two accounts are
+just two config dirs. **Claude Desktop has no such switch.** On Windows it ships
+as an **MSIX/Store package**: its login lives in one isolated per-package store,
+the packaged binary refuses a second launch, and it is single-instance — so you
+can't simply "run it twice" for two accounts.
+
+The one isolation knob Desktop *does* support is Electron's `--user-data-dir`,
+but that only works on a binary you launch directly, which the MSIX container
+blocks. The workaround is to copy the Desktop payload out to a normal folder (a
+"loose" build) and launch **that** with its own `--user-data-dir`. Your primary
+account keeps using the normal Store app; each extra account runs from the loose
+copy with a separate profile — **side by side, both logged in at once.**
+
+### Set up a second Desktop account
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\setup_desktop_account.ps1
+```
+
+The script finds your installed Claude Desktop, copies its payload to
+`%LOCALAPPDATA%\ClaudeDesktopStandalone`, creates a fresh profile directory
+(`%USERPROFILE%\.claude-desktop-account2` by default), prints a `config.json`
+snippet, and opens the loose copy so you can **sign in with your second account**.
+It runs at the same time as your main Desktop without logging it out.
+
+Then point the widget at it in `config.json`:
+
+```json
+{
+  "launch_mode": "cli",
+  "desktop": {
+    "aumid": "Claude_pzs8sxrjxfjjc!Claude",
+    "standalone_exe": "%LOCALAPPDATA%\\ClaudeDesktopStandalone\\app\\Claude.exe"
+  },
+  "accounts": [
+    { "label": "claude1", "config_dir": "%USERPROFILE%\\.claude-account1", "desktop": "store" },
+    { "label": "claude2", "config_dir": "%USERPROFILE%\\.claude-account2",
+      "desktop": { "data_dir": "%USERPROFILE%\\.claude-desktop-account2" } }
+  ]
+}
+```
+
+| Key | Meaning |
+|---|---|
+| `launch_mode` | Global launch target: `"cli"` (terminal, default) or `"desktop"`. Toggle it in **Settings (⚙)**. |
+| `desktop.aumid` | The Store app's launch ID, used for any account marked `"desktop": "store"`. Stable across updates. |
+| `desktop.standalone_exe` | The loose copy's `Claude.exe`, used for accounts that have a `data_dir`. |
+| `accounts[].desktop` | Per account: `"store"` (the installed Store app) **or** `{ "data_dir": "…" }` (a standalone profile). Omit it and the first account defaults to `"store"`, the rest to their own standalone profile. |
+
+### Limitations
+
+- The loose copy is **frozen at the version you copied** — it won't auto-update.
+  Re-run `setup_desktop_account.ps1` after Claude Desktop updates to refresh it.
+- Sign-in happens in the second window's own flow. If your browser's callback
+  focuses your *primary* Desktop instead, complete the login from inside the
+  second window.
+- This only changes how the widget *launches* Desktop; the usage numbers still
+  come from each account's CLI credentials, exactly as before.
+
+---
+
 ## How it works
 
 Data comes from the same OAuth endpoints Claude Code itself uses:
@@ -195,8 +274,17 @@ When a token is about to expire (they live ~8h) the widget refreshes it and
 
 > ⚠️ The token endpoint sits behind Cloudflare and rejects requests without a
 > `User-Agent` header, so the widget sends a `claude-cli/...` UA. The usage
-> endpoint is rate-limited per account, so polling defaults to 180s with
-> per-account exponential backoff.
+> endpoint is rate-limited per account, so polling defaults to 180s (15s
+> minimum) with per-account exponential backoff that backs off up to 10 minutes
+> on repeated failures. The reset countdowns still tick every second locally.
+
+### Files the widget writes (all local, all git-ignored)
+
+| File | Contents |
+|---|---|
+| `config.json` | Your accounts and settings (seeded from `config.example.json` on first run). |
+| `widget_state.json` | Window position and whether you left it collapsed or expanded. |
+| `widget_usage.json` | The latest session/weekly numbers and e-mail for every account, atomically rewritten on each poll. Other local tools can read this to show your limits **without** spending their own rate-limited API calls. |
 
 ## Autostart with Windows (optional)
 
@@ -261,6 +349,9 @@ into that folder.
 
 - **Перетягування** — затисніть будь-де на панелі.
 - **➕** — додати акаунт (невелика форма прямо у віджеті).
+- **⚙** — налаштування: глобально обрати, що відкриває кнопка проєкту —
+  **Claude CLI** (термінал) чи **Claude Desktop** (застосунок). Див.
+  [Відкривати проєкти в Claude Desktop](#відкривати-проєкти-в-claude-desktop).
 - **－ / □** — згорнути у [компактний режим з кільцями](#компактний-режим) /
   розгорнути назад.
 - **◉** — закріпити поверх вікон (зелений = увімкнено, сірий = вимкнено).
@@ -341,12 +432,97 @@ claude2      # далі /login — вхід другим акаунтом
 **Переавторизація:** якщо акаунт показує `no credentials` — запустіть його
 команду (`claude1`) і знову `/login`, або клацніть будь-який його проєкт.
 
+## Відкривати проєкти в Claude Desktop
+
+Типово кнопка проєкту відкриває **термінал** і запускає Claude CLI акаунта. У
+**Налаштуваннях (⚙)** можна одним глобальним перемикачем змусити кнопки натомість
+відкривати застосунок **Claude Desktop** для цього акаунта:
+
+- **Claude CLI** — консоль із `claudeN.bat` (типово).
+- **Claude Desktop** — десктоп-застосунок, по вікну на акаунт.
+
+(Перемикач глобальний, не на кожен акаунт; зберігається як `launch_mode` у
+`config.json`. У режимі Desktop *шлях* проєкту не використовується — у Desktop
+немає аргументу робочої теки — тож клік просто відкриває застосунок акаунта.)
+
+### Чому Desktop потребує додаткового налаштування (а CLI — ні)
+
+Claude Code (CLI) обирає логін за `CLAUDE_CONFIG_DIR`, тож два акаунти — це просто
+два каталоги. **У Claude Desktop такого перемикача немає.** На Windows він
+постачається як **MSIX/Store-пакет**: логін лежить в ізольованому сховищі пакета,
+бінарник не дає запустити себе вдруге, і застосунок single-instance — тож просто
+«запустити двічі» для двох акаунтів не вийде.
+
+Єдиний механізм ізоляції, який Desktop *підтримує*, — це Electron-флаг
+`--user-data-dir`, але він діє лише на бінарник, який ви запускаєте напряму, а
+контейнер MSIX це блокує. Обхід: скопіювати payload Desktop у звичайну теку
+(«loose»-білд) і запускати **його** з власним `--user-data-dir`. Основний акаунт
+далі користується звичайним Store-застосунком; кожен додатковий — loose-копією з
+окремим профілем, **паралельно, обидва залогінені одночасно.**
+
+### Налаштувати другий акаунт Desktop
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\setup_desktop_account.ps1
+```
+
+Скрипт знаходить встановлений Claude Desktop, копіює payload у
+`%LOCALAPPDATA%\ClaudeDesktopStandalone`, створює свіжий профіль
+(`%USERPROFILE%\.claude-desktop-account2` за замовчуванням), друкує фрагмент для
+`config.json` і відкриває loose-копію, щоб ви **увійшли другим акаунтом**. Вона
+працює одночасно з основним Desktop, не розлогінюючи його.
+
+Далі вкажіть це віджету в `config.json`:
+
+```json
+{
+  "launch_mode": "cli",
+  "desktop": {
+    "aumid": "Claude_pzs8sxrjxfjjc!Claude",
+    "standalone_exe": "%LOCALAPPDATA%\\ClaudeDesktopStandalone\\app\\Claude.exe"
+  },
+  "accounts": [
+    { "label": "claude1", "config_dir": "%USERPROFILE%\\.claude-account1", "desktop": "store" },
+    { "label": "claude2", "config_dir": "%USERPROFILE%\\.claude-account2",
+      "desktop": { "data_dir": "%USERPROFILE%\\.claude-desktop-account2" } }
+  ]
+}
+```
+
+- `launch_mode` — глобальна ціль запуску: `"cli"` (термінал, типово) або
+  `"desktop"`. Перемикається в **Налаштуваннях (⚙)**.
+- `desktop.aumid` — ID запуску Store-застосунку для акаунтів із `"desktop": "store"`
+  (стабільний між оновленнями).
+- `desktop.standalone_exe` — `Claude.exe` loose-копії для акаунтів із `data_dir`.
+- `accounts[].desktop` — на акаунт: `"store"` (встановлений Store-застосунок) **або**
+  `{ "data_dir": "…" }` (окремий профіль). Якщо не вказати — перший акаунт типово
+  `"store"`, решта — власний standalone-профіль.
+
+### Обмеження
+
+- Loose-копія **заморожена на скопійованій версії** — сама не оновлюється. Після
+  оновлення Claude Desktop перезапустіть `setup_desktop_account.ps1`, щоб її освіжити.
+- Вхід відбувається у власному вікні другого застосунку. Якщо колбек браузера
+  фокусує *основний* Desktop — завершіть вхід усередині другого вікна.
+- Це міняє лише те, як віджет *запускає* Desktop; цифри використання так само
+  беруться з CLI-кредів кожного акаунта, як і раніше.
+
 ## Як це працює
 
 Дані беруться з тих самих OAuth-ендпоінтів, що використовує Claude Code
 (`/api/oauth/usage`, `/api/oauth/profile`, `/v1/oauth/token`). Токени читаються з
 `<config_dir>\.credentials.json` і автоматично оновлюються та **записуються
-назад**, тож Claude Code і віджет лишаються синхронізованими.
+назад**, тож Claude Code і віджет лишаються синхронізованими. Опитування типово
+кожні 180с (мінімум 15с), із покроковим backoff на акаунт до 10 хвилин у разі
+повторних помилок; лічильники до ресету оновлюються щосекунди локально.
+
+### Файли, які створює віджет (усі локальні, усі в `.gitignore`)
+
+| Файл | Що містить |
+|---|---|
+| `config.json` | Ваші акаунти й налаштування (на першому запуску — з `config.example.json`). |
+| `widget_state.json` | Позиція вікна та стан згорнуто/розгорнуто. |
+| `widget_usage.json` | Свіжі цифри session/weekly та e-mail кожного акаунта, атомарно перезаписуються при кожному опитуванні. Інші локальні інструменти можуть читати цей файл, щоб показувати ваші ліміти, **не** витрачаючи власні запити до API. |
 
 ## Автозапуск із Windows
 
